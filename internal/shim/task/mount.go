@@ -39,8 +39,9 @@ type diskOptions struct {
 }
 
 // transformMounts does not perform any local mounts but transforms
-// the mounts to be used inside the VM via virtio
-func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*types.Mount) ([]*types.Mount, error) {
+// the mounts to be used inside the VM via virtio.
+// Returns the transformed mounts and the next available disk letter.
+func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*types.Mount) ([]*types.Mount, byte, error) {
 	var (
 		disks    byte = 'a'
 		addDisks []diskOptions
@@ -117,7 +118,7 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 					// Having the upper as virtiofs may return invalid argument, avoid
 					// transforming and attempt to perform the mounts on the host if
 					// supported.
-					return nil, fmt.Errorf("cannot use virtiofs for upper dir in overlay: %w", errdefs.ErrNotImplemented)
+					return nil, 0, fmt.Errorf("cannot use virtiofs for upper dir in overlay: %w", errdefs.ErrNotImplemented)
 				}
 			} else {
 				log.G(ctx).WithField("options", m.Options).Warnf("overlayfs missing workdir or upperdir")
@@ -130,7 +131,7 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 	}
 
 	if len(addDisks) > 10 {
-		return nil, fmt.Errorf("exceeded maximum virtio disk count: %d > 10: %w", len(addDisks), errdefs.ErrNotImplemented)
+		return nil, 0, fmt.Errorf("exceeded maximum virtio disk count: %d > 10: %w", len(addDisks), errdefs.ErrNotImplemented)
 	}
 
 	for _, do := range addDisks {
@@ -139,11 +140,11 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 			opts = append(opts, vm.WithReadOnly())
 		}
 		if err := vmi.AddDisk(ctx, do.name, do.source, opts...); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 
-	return am, err
+	return am, disks, err
 }
 
 func filterOptions(options []string) []string {

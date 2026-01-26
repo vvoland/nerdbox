@@ -26,6 +26,6 @@ import (
 	"github.com/containerd/nerdbox/internal/vm"
 )
 
-func setupMounts(_ context.Context, vmi vm.Instance, id string, ms []*types.Mount, rootfs, _ string) ([]*types.Mount, error) {
-	return ms, nil
+func setupMounts(_ context.Context, vmi vm.Instance, id string, ms []*types.Mount, rootfs, _ string) ([]*types.Mount, byte, error) {
+	return ms, 'a', nil
 }

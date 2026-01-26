@@ -193,7 +193,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 		return nil, errgrpc.ToGRPC(err)
 	}
 
-	m, err := setupMounts(ctx, vmi, r.ID, r.Rootfs, b.Rootfs, filepath.Join(r.Bundle, "mounts"))
+	m, nextDiskLetter, err := setupMounts(ctx, vmi, r.ID, r.Rootfs, b.Rootfs, filepath.Join(r.Bundle, "mounts"))
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
@@ -206,6 +206,8 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 		return nil, errgrpc.ToGRPC(err)
 	}
 
+	// Set the starting disk letter for container mounts based on what was used by rootfs
+	ctrMounts.SetStartingDiskLetter(nextDiskLetter)
 	if err := ctrMounts.SetupVM(ctx, vmi); err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}

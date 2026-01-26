@@ -37,11 +37,18 @@ type ctrMountTransform struct {
 	// specIndex is the index of this mount in the OCI spec's Mounts slice.
 	specIndex int
 
+	// specMount is a pointer to the mount in the spec that will be updated
+	// with the VM device path once the disk letter is known.
+	specMount *specs.Mount
+
 	// originalSource is the original source path before transformation.
 	originalSource string
 
-	// disk contains the disk configuration if this mount requires a block device.
-	disk *diskOptions
+	// fsType is the filesystem type (e.g., "ext4").
+	fsType string
+
+	// readOnly indicates if the disk should be read-only.
+	readOnly bool
 }
 
 // ctrMountTransformer transforms container mounts (from OCI spec) that require
@@ -55,16 +62,20 @@ type ctrMountTransformer struct {
 	transforms []ctrMountTransform
 
 	// diskLetter tracks the next available disk letter for virtio block devices.
-	// Starts at 'a' and increments for each disk added.
 	diskLetter byte
 }
 
-// FromBundle processes the bundle's OCI spec mounts and identifies those that
-// need transformation for VM execution. It modifies the spec in place to update
-// mount sources to VM device paths.
-func (t *ctrMountTransformer) FromBundle(ctx context.Context, b *bundle.Bundle) error {
-	t.diskLetter = 'a'
+// SetStartingDiskLetter sets the starting disk letter for new block devices.
+// This should be called with the next available letter after rootfs mounts
+// have been set up.
+func (t *ctrMountTransformer) SetStartingDiskLetter(letter byte) {
+	t.diskLetter = letter
+}
 
+// FromBundle processes the bundle's OCI spec mounts and identifies those that
+// need transformation for VM execution. It collects information but does NOT
+// modify the spec yet - that happens in SetupVM when we know the disk letters.
+func (t *ctrMountTransformer) FromBundle(ctx context.Context, b *bundle.Bundle) error {
 	for i := range b.Spec.Mounts {
 		m := &b.Spec.Mounts[i]
 
@@ -97,9 +108,6 @@ func (t *ctrMountTransformer) processCtrMount(ctx context.Context, index int, m 
 // 1. Formatted with mkfs on the host (handled by the snapshotter)
 // 2. Attached as a block device to the VM
 // 3. Mounted inside the VM at the specified destination
-//
-// The mount type is transformed from "mkfs/ext4" to "format/ext4" so that
-// mountutil.All() in the VM can process the format/ prefix and handle templates.
 func (t *ctrMountTransformer) processMkfsMount(ctx context.Context, index int, m *specs.Mount) (*ctrMountTransform, error) {
 	// Extract the filesystem type from "mkfs/<fstype>"
 	fsType := strings.TrimPrefix(m.Type, "mkfs/")
@@ -118,56 +126,62 @@ func (t *ctrMountTransformer) processMkfsMount(ctx context.Context, index int, m
 	// Check if read-only based on options
 	readOnly := slices.Contains(m.Options, "ro")
 
-	// Create a unique disk name based on the destination
-	hash := sha256.Sum256([]byte(m.Destination))
-	diskName := fmt.Sprintf("ctr-%c-%x", t.diskLetter, hash[:4])
-	// virtiofs implementation has a limit of 36 characters for the tag
-	if len(diskName) > 36 {
-		diskName = diskName[:36]
-	}
-
-	// The device path inside the VM
-	vmDevicePath := fmt.Sprintf("/dev/vd%c", t.diskLetter)
-	t.diskLetter++
-
-	// Update the mount in the spec to use the VM device path.
-	// Keep the "format/" prefix so mountutil.All() in the VM can handle templates
-	// in subsequent mounts that reference this mount.
-	m.Type = "format/" + fsType
-	m.Source = vmDevicePath
-	// Filter out mkfs-specific options, keep only mount options
+	// Filter out mkfs-specific options now, keep only mount options
 	m.Options = filterMkfsOptions(m.Options)
 
 	return &ctrMountTransform{
 		specIndex:      index,
+		specMount:      m,
 		originalSource: originalSource,
-		disk: &diskOptions{
-			name:     diskName,
-			source:   originalSource,
-			readOnly: readOnly,
-		},
+		fsType:         fsType,
+		readOnly:       readOnly,
 	}, nil
 }
 
-// SetupVM attaches the required block devices to the VM instance.
+// SetupVM attaches the required block devices to the VM instance and updates
+// the spec mounts with the VM device paths.
 func (t *ctrMountTransformer) SetupVM(ctx context.Context, vmi vm.Instance) error {
+	// If diskLetter wasn't set, start from 'a' (though this shouldn't happen
+	// in normal usage since SetStartingDiskLetter should be called first)
+	if t.diskLetter == 0 {
+		t.diskLetter = 'a'
+	}
+
 	for _, transform := range t.transforms {
-		if transform.disk != nil {
-			var opts []vm.MountOpt
-			if transform.disk.readOnly {
-				opts = append(opts, vm.WithReadOnly())
-			}
-
-			log.G(ctx).WithFields(log.Fields{
-				"diskName": transform.disk.name,
-				"source":   transform.disk.source,
-				"readOnly": transform.disk.readOnly,
-			}).Debug("adding block device for container mount")
-
-			if err := vmi.AddDisk(ctx, transform.disk.name, transform.disk.source, opts...); err != nil {
-				return fmt.Errorf("adding disk %s: %w", transform.disk.name, err)
-			}
+		// Create a unique disk name based on the destination
+		hash := sha256.Sum256([]byte(transform.specMount.Destination))
+		diskName := fmt.Sprintf("ctr-%c-%x", t.diskLetter, hash[:4])
+		// virtiofs implementation has a limit of 36 characters for the tag
+		if len(diskName) > 36 {
+			diskName = diskName[:36]
 		}
+
+		// The device path inside the VM
+		vmDevicePath := fmt.Sprintf("/dev/vd%c", t.diskLetter)
+
+		log.G(ctx).WithFields(log.Fields{
+			"diskName":     diskName,
+			"source":       transform.originalSource,
+			"vmDevicePath": vmDevicePath,
+			"readOnly":     transform.readOnly,
+		}).Debug("adding block device for container mount")
+
+		var opts []vm.MountOpt
+		if transform.readOnly {
+			opts = append(opts, vm.WithReadOnly())
+		}
+
+		if err := vmi.AddDisk(ctx, diskName, transform.originalSource, opts...); err != nil {
+			return fmt.Errorf("adding disk %s: %w", diskName, err)
+		}
+
+		// Now update the mount in the spec to use the VM device path.
+		// Keep the "format/" prefix so the VM-side code can handle templates
+		// in subsequent mounts that reference this mount.
+		transform.specMount.Type = "format/" + transform.fsType
+		transform.specMount.Source = vmDevicePath
+
+		t.diskLetter++
 	}
 	return nil
 }

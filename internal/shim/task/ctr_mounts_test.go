@@ -18,30 +18,30 @@ package task
 
 import (
 	"context"
-	"strings"
+	"net"
 	"testing"
 
+	"github.com/containerd/ttrpc"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/containerd/nerdbox/internal/shim/task/bundle"
+	"github.com/containerd/nerdbox/internal/vm"
 )
 
-func TestCtrMountTransformer(t *testing.T) {
+func TestCtrMountTransformerFromBundle(t *testing.T) {
 	testcases := []struct {
-		name           string
-		mounts         []specs.Mount
-		wantMounts     []specs.Mount
-		wantNumDisks   int
-		wantDiskLetter byte
+		name              string
+		mounts            []specs.Mount
+		wantNumTransforms int
+		// After FromBundle, mkfs options should be filtered but type/source unchanged
+		wantOptions [][]string
 	}{
 		{
-			name:           "no mounts",
-			mounts:         nil,
-			wantMounts:     nil,
-			wantNumDisks:   0,
-			wantDiskLetter: 'a',
+			name:              "no mounts",
+			mounts:            nil,
+			wantNumTransforms: 0,
 		},
 		{
 			name: "no mkfs mounts",
@@ -49,12 +49,7 @@ func TestCtrMountTransformer(t *testing.T) {
 				{Type: "tmpfs", Source: "tmpfs", Destination: "/tmp"},
 				{Type: "bind", Source: "/host/path", Destination: "/container/path"},
 			},
-			wantMounts: []specs.Mount{
-				{Type: "tmpfs", Source: "tmpfs", Destination: "/tmp"},
-				{Type: "bind", Source: "/host/path", Destination: "/container/path"},
-			},
-			wantNumDisks:   0,
-			wantDiskLetter: 'a',
+			wantNumTransforms: 0,
 		},
 		{
 			name: "single mkfs/ext4 mount",
@@ -66,16 +61,8 @@ func TestCtrMountTransformer(t *testing.T) {
 					Options:     []string{"X-containerd.mkfs.fs=ext4", "X-containerd.mkfs.size=67108864", "rw", "loop"},
 				},
 			},
-			wantMounts: []specs.Mount{
-				{
-					Type:        "format/ext4",
-					Source:      "/dev/vda",
-					Destination: "/data",
-					Options:     []string{"rw"},
-				},
-			},
-			wantNumDisks:   1,
-			wantDiskLetter: 'b',
+			wantNumTransforms: 1,
+			wantOptions:       [][]string{{"rw"}},
 		},
 		{
 			name: "mkfs/ext4 with format/mkdir/bind (typical erofs+rw pattern)",
@@ -93,45 +80,8 @@ func TestCtrMountTransformer(t *testing.T) {
 					Options:     []string{"X-containerd.mkdir.path={{ mount 0 }}/upper:0755", "rw", "rbind"},
 				},
 			},
-			wantMounts: []specs.Mount{
-				{
-					Type:        "format/ext4",
-					Source:      "/dev/vda",
-					Destination: "/data",
-					Options:     []string{"rw"},
-				},
-				// format/mkdir/bind mount is passed through unchanged -
-				// it uses templates that mountutil.All() in the VM will process
-				{
-					Type:        "format/mkdir/bind",
-					Source:      "{{ mount 0 }}/upper",
-					Destination: "/data",
-					Options:     []string{"X-containerd.mkdir.path={{ mount 0 }}/upper:0755", "rw", "rbind"},
-				},
-			},
-			wantNumDisks:   1,
-			wantDiskLetter: 'b',
-		},
-		{
-			name: "mkfs/ext4 readonly mount",
-			mounts: []specs.Mount{
-				{
-					Type:        "mkfs/ext4",
-					Source:      "/path/to/readonly.img",
-					Destination: "/readonly-data",
-					Options:     []string{"ro", "loop"},
-				},
-			},
-			wantMounts: []specs.Mount{
-				{
-					Type:        "format/ext4",
-					Source:      "/dev/vda",
-					Destination: "/readonly-data",
-					Options:     []string{"ro"},
-				},
-			},
-			wantNumDisks:   1,
-			wantDiskLetter: 'b',
+			wantNumTransforms: 1, // Only the mkfs mount creates a transform
+			wantOptions:       [][]string{{"rw"}},
 		},
 		{
 			name: "multiple mkfs mounts",
@@ -149,22 +99,8 @@ func TestCtrMountTransformer(t *testing.T) {
 					Options:     []string{"rw", "loop"},
 				},
 			},
-			wantMounts: []specs.Mount{
-				{
-					Type:        "format/ext4",
-					Source:      "/dev/vda",
-					Destination: "/data1",
-					Options:     []string{"rw"},
-				},
-				{
-					Type:        "format/ext4",
-					Source:      "/dev/vdb",
-					Destination: "/data2",
-					Options:     []string{"rw"},
-				},
-			},
-			wantNumDisks:   2,
-			wantDiskLetter: 'c',
+			wantNumTransforms: 2,
+			wantOptions:       [][]string{{"rw"}, {"rw"}},
 		},
 	}
 
@@ -180,21 +116,15 @@ func TestCtrMountTransformer(t *testing.T) {
 			err := transformer.FromBundle(context.Background(), b)
 			require.NoError(t, err)
 
-			// Verify that the spec mounts were transformed
-			assert.Equal(t, tc.wantMounts, b.Spec.Mounts)
-
 			// Verify the number of transforms
-			assert.Equal(t, tc.wantNumDisks, len(transformer.transforms))
+			assert.Equal(t, tc.wantNumTransforms, len(transformer.transforms))
 
-			// Verify disk letter progression
-			assert.Equal(t, tc.wantDiskLetter, transformer.diskLetter)
-
-			// Verify each transform has a valid disk config
+			// Verify options were filtered
 			for i, transform := range transformer.transforms {
-				assert.NotNil(t, transform.disk, "transform %d should have disk", i)
-				// Verify disk name format: ctr-<letter>-<hash>
-				assert.True(t, strings.HasPrefix(transform.disk.name, "ctr-"), "disk name should start with 'ctr-'")
-				assert.LessOrEqual(t, len(transform.disk.name), 36, "disk name should be <= 36 chars")
+				if tc.wantOptions != nil && i < len(tc.wantOptions) {
+					assert.Equal(t, tc.wantOptions[i], transform.specMount.Options,
+						"transform %d options mismatch", i)
+				}
 			}
 		})
 	}
@@ -222,10 +152,8 @@ func TestCtrMountTransformerPreservesOriginalSource(t *testing.T) {
 	require.Len(t, transformer.transforms, 1)
 	// The transform should preserve the original source for SetupVM
 	assert.Equal(t, originalSource, transformer.transforms[0].originalSource)
-	assert.Equal(t, originalSource, transformer.transforms[0].disk.source)
-
-	// But the spec mount should have been updated to the VM device path
-	assert.Equal(t, "/dev/vda", b.Spec.Mounts[0].Source)
+	// The spec mount source should still be the original (until SetupVM is called)
+	assert.Equal(t, originalSource, b.Spec.Mounts[0].Source)
 }
 
 func TestCtrMountTransformerReadOnly(t *testing.T) {
@@ -247,7 +175,49 @@ func TestCtrMountTransformerReadOnly(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, transformer.transforms, 1)
-	assert.True(t, transformer.transforms[0].disk.readOnly)
+	assert.True(t, transformer.transforms[0].readOnly)
+}
+
+func TestCtrMountTransformerDiskLetterProgression(t *testing.T) {
+	b := &bundle.Bundle{
+		Spec: specs.Spec{
+			Mounts: []specs.Mount{
+				{
+					Type:        "mkfs/ext4",
+					Source:      "/path/to/data1.img",
+					Destination: "/data1",
+					Options:     []string{"rw"},
+				},
+				{
+					Type:        "mkfs/ext4",
+					Source:      "/path/to/data2.img",
+					Destination: "/data2",
+					Options:     []string{"rw"},
+				},
+			},
+		},
+	}
+
+	transformer := &ctrMountTransformer{}
+	err := transformer.FromBundle(context.Background(), b)
+	require.NoError(t, err)
+
+	// Simulate that rootfs mounts used 'a' and 'b', so we start from 'c'
+	transformer.SetStartingDiskLetter('c')
+
+	// Create a mock VM instance that just tracks AddDisk calls
+	mockVM := &mockVMInstance{}
+	err = transformer.SetupVM(context.Background(), mockVM)
+	require.NoError(t, err)
+
+	// Verify that disks were added
+	assert.Equal(t, 2, len(mockVM.disks))
+
+	// Verify the spec mounts were updated with correct device paths
+	assert.Equal(t, "format/ext4", b.Spec.Mounts[0].Type)
+	assert.Equal(t, "/dev/vdc", b.Spec.Mounts[0].Source)
+	assert.Equal(t, "format/ext4", b.Spec.Mounts[1].Type)
+	assert.Equal(t, "/dev/vdd", b.Spec.Mounts[1].Source)
 }
 
 func TestFilterMkfsOptions(t *testing.T) {
@@ -294,4 +264,50 @@ func TestFilterMkfsOptions(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// mockVMInstance is a test double for vm.Instance
+type mockVMInstance struct {
+	disks []mockDisk
+}
+
+type mockDisk struct {
+	name     string
+	source   string
+	readOnly bool
+}
+
+func (m *mockVMInstance) AddDisk(ctx context.Context, name, source string, opts ...vm.MountOpt) error {
+	disk := mockDisk{name: name, source: source}
+	cfg := &vm.MountConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	disk.readOnly = cfg.Readonly
+	m.disks = append(m.disks, disk)
+	return nil
+}
+
+func (m *mockVMInstance) AddFS(ctx context.Context, tag, path string, opts ...vm.MountOpt) error {
+	return nil
+}
+
+func (m *mockVMInstance) AddNIC(ctx context.Context, endpoint string, mac net.HardwareAddr, mode vm.NetworkMode, features, flags uint32) error {
+	return nil
+}
+
+func (m *mockVMInstance) Start(ctx context.Context, opts ...vm.StartOpt) error {
+	return nil
+}
+
+func (m *mockVMInstance) Client() *ttrpc.Client {
+	return nil
+}
+
+func (m *mockVMInstance) Shutdown(ctx context.Context) error {
+	return nil
+}
+
+func (m *mockVMInstance) StartStream(ctx context.Context) (uint32, net.Conn, error) {
+	return 0, nil, nil
 }
