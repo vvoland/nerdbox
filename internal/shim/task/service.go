@@ -191,10 +191,13 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 		return nil, errgrpc.ToGRPC(err)
 	}
 
-	m, err := setupMounts(ctx, vmi, r.ID, r.Rootfs, b.Rootfs, filepath.Join(r.Bundle, "mounts"))
+	m, rootfsDiskCount, err := setupMounts(ctx, vmi, r.ID, r.Rootfs, b.Rootfs, filepath.Join(r.Bundle, "mounts"))
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
+
+	// Set disk offset for spec mounts based on how many disks rootfs used
+	bm.SetDiskOffset(rootfsDiskCount)
 
 	if err := nwpr.SetupVM(ctx, vmi); err != nil {
 		return nil, errgrpc.ToGRPC(err)

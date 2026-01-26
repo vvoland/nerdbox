@@ -27,6 +27,7 @@ import (
 	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/containerd/nerdbox/internal/shim/task/bundle"
 	"github.com/containerd/nerdbox/internal/vm"
@@ -39,8 +40,9 @@ type diskOptions struct {
 }
 
 // transformMounts does not perform any local mounts but transforms
-// the mounts to be used inside the VM via virtio
-func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*types.Mount) ([]*types.Mount, error) {
+// the mounts to be used inside the VM via virtio.
+// Returns the transformed mounts and the number of disks allocated.
+func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*types.Mount) ([]*types.Mount, byte, error) {
 	var (
 		disks    byte = 'a'
 		addDisks []diskOptions
@@ -110,7 +112,7 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 					// Having the upper as virtiofs may return invalid argument, avoid
 					// transforming and attempt to perform the mounts on the host if
 					// supported.
-					return nil, fmt.Errorf("cannot use virtiofs for upper dir in overlay: %w", errdefs.ErrNotImplemented)
+					return nil, 0, fmt.Errorf("cannot use virtiofs for upper dir in overlay: %w", errdefs.ErrNotImplemented)
 				}
 			} else {
 				log.G(ctx).WithField("options", m.Options).Warnf("overlayfs missing workdir or upperdir")
@@ -123,7 +125,7 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 	}
 
 	if len(addDisks) > 10 {
-		return nil, fmt.Errorf("exceeded maximum virtio disk count: %d > 10: %w", len(addDisks), errdefs.ErrNotImplemented)
+		return nil, 0, fmt.Errorf("exceeded maximum virtio disk count: %d > 10: %w", len(addDisks), errdefs.ErrNotImplemented)
 	}
 
 	for _, do := range addDisks {
@@ -132,11 +134,13 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 			opts = append(opts, vm.WithReadOnly())
 		}
 		if err := vmi.AddDisk(ctx, do.name, do.source, opts...); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 
-	return am, err
+	// Return the number of disks used (disks - 'a' gives the count)
+	diskCount := disks - 'a'
+	return am, diskCount, err
 }
 
 func filterOptions(options []string) []string {
@@ -151,60 +155,256 @@ func filterOptions(options []string) []string {
 	return filtered
 }
 
-type bindMounter struct {
-	mounts []bindMount
+// specMount represents a mount from the OCI spec that needs VM setup.
+// It supports different mount types:
+//   - bind: transformed to virtiofs shares
+//   - erofs: passed as virtio block devices (read-only)
+//   - ext4: passed as virtio block devices
+type specMount struct {
+	// mountType is the original mount type from the OCI spec (bind, erofs, ext4)
+	mountType string
+	// tag is the virtio-fs tag (for bind mounts) or disk identifier
+	tag string
+	// hostSrc is the source path on the host
+	hostSrc string
+	// vmTarget is the mount target path in the VM (for pre-mounting)
+	vmTarget string
+	// vmSource is the source in the VM (device path for block devices)
+	vmSource string
+	// options are mount options
+	options []string
+	// readOnly indicates if the mount should be read-only
+	readOnly bool
 }
 
-type bindMount struct {
-	tag      string
-	hostSrc  string
-	vmTarget string
+type bindMounter struct {
+	mounts []specMount
+	// diskCounter tracks the next available virtio disk letter
+	diskCounter byte
+}
+
+// SetDiskOffset sets the starting disk letter offset.
+// This should be called before FromBundle if there are rootfs disks
+// that have already been allocated.
+func (bm *bindMounter) SetDiskOffset(offset byte) {
+	bm.diskCounter = 'a' + offset
+}
+
+// DiskCount returns the number of disks allocated by this mounter.
+func (bm *bindMounter) DiskCount() byte {
+	count := byte(0)
+	for _, m := range bm.mounts {
+		if m.mountType == "erofs" || m.mountType == "ext4" {
+			count++
+		}
+	}
+	return count
+}
+
+// diskLetter returns the next available disk letter and increments the counter
+func (bm *bindMounter) nextDiskLetter() byte {
+	if bm.diskCounter == 0 {
+		bm.diskCounter = 'a'
+	}
+	letter := bm.diskCounter
+	bm.diskCounter++
+	return letter
 }
 
 func (bm *bindMounter) FromBundle(ctx context.Context, b *bundle.Bundle) error {
 	for i, m := range b.Spec.Mounts {
-		if m.Type != "bind" {
-			continue
+		mountType := m.Type
+		// Strip format/ prefix - format transformations are handled VM-side
+		mountType = strings.TrimPrefix(mountType, "format/")
+		// Strip mkdir/ prefix - mkdir is handled VM-side
+		mountType = strings.TrimPrefix(mountType, "mkdir/")
+
+		switch mountType {
+		case "bind":
+			if err := bm.addBindMount(ctx, b, i, m); err != nil {
+				return err
+			}
+		case "erofs":
+			if err := bm.addErofsMount(ctx, b, i, m); err != nil {
+				return err
+			}
+		case "ext4":
+			if err := bm.addExt4Mount(ctx, b, i, m); err != nil {
+				return err
+			}
 		}
-
-		log.G(ctx).WithField("mount", m).Debug("transforming bind mount into a virtiofs mount")
-
-		fi, err := os.Stat(m.Source)
-		if err != nil {
-			return fmt.Errorf("failed to stat bind mount source %s: %w", m.Source, err)
-		}
-
-		hash := sha256.Sum256([]byte(m.Destination))
-		tag := fmt.Sprintf("bind-%x", hash[:8])
-		vmTarget := "/mnt/" + tag
-
-		// For files, share the parent directory via virtiofs since virtiofs
-		// operates on directories. The spec source points to the file within
-		// the mounted directory.
-		hostSrc := m.Source
-		specSrc := vmTarget
-		if !fi.IsDir() {
-			hostSrc = filepath.Dir(m.Source)
-			specSrc = filepath.Join(vmTarget, filepath.Base(m.Source))
-		}
-
-		transformed := bindMount{
-			tag:      tag,
-			hostSrc:  hostSrc,
-			vmTarget: vmTarget,
-		}
-
-		bm.mounts = append(bm.mounts, transformed)
-		b.Spec.Mounts[i].Source = specSrc
 	}
 
 	return nil
 }
 
+func (bm *bindMounter) addBindMount(ctx context.Context, b *bundle.Bundle, i int, m specs.Mount) error {
+	log.G(ctx).WithField("mount", m).Debug("transforming bind mount into a virtiofs mount")
+
+	fi, err := os.Stat(m.Source)
+	if err != nil {
+		return fmt.Errorf("failed to stat bind mount source %s: %w", m.Source, err)
+	}
+
+	hash := sha256.Sum256([]byte(m.Destination))
+	tag := fmt.Sprintf("bind-%x", hash[:8])
+	vmTarget := "/mnt/" + tag
+
+	// For files, share the parent directory via virtiofs since virtiofs
+	// operates on directories. The spec source points to the file within
+	// the mounted directory.
+	hostSrc := m.Source
+	specSrc := vmTarget
+	if !fi.IsDir() {
+		hostSrc = filepath.Dir(m.Source)
+		specSrc = filepath.Join(vmTarget, filepath.Base(m.Source))
+	}
+
+	transformed := specMount{
+		mountType: "bind",
+		tag:       tag,
+		hostSrc:   hostSrc,
+		vmTarget:  vmTarget,
+	}
+
+	bm.mounts = append(bm.mounts, transformed)
+	b.Spec.Mounts[i].Source = specSrc
+
+	return nil
+}
+
+func (bm *bindMounter) addErofsMount(ctx context.Context, b *bundle.Bundle, i int, m specs.Mount) error {
+	log.G(ctx).WithField("mount", m).Debug("transforming erofs mount into a virtio block device mount")
+
+	// Verify the source file exists
+	if _, err := os.Stat(m.Source); err != nil {
+		return fmt.Errorf("failed to stat erofs mount source %s: %w", m.Source, err)
+	}
+
+	hash := sha256.Sum256([]byte(m.Destination))
+	tag := fmt.Sprintf("erofs-%x", hash[:8])
+	diskLetter := bm.nextDiskLetter()
+	vmDevice := fmt.Sprintf("/dev/vd%c", diskLetter)
+	vmTarget := "/mnt/" + tag
+
+	transformed := specMount{
+		mountType: "erofs",
+		tag:       tag,
+		hostSrc:   m.Source,
+		vmTarget:  vmTarget,
+		vmSource:  vmDevice,
+		options:   filterSpecOptions(m.Options),
+		readOnly:  true,
+	}
+
+	bm.mounts = append(bm.mounts, transformed)
+	// Update the spec to use the VM target path
+	b.Spec.Mounts[i].Source = vmTarget
+	// Change the type back to bind since the erofs will be pre-mounted in the VM
+	b.Spec.Mounts[i].Type = "bind"
+	// Remove erofs-specific options that don't apply to bind mounts
+	b.Spec.Mounts[i].Options = filterBindOptions(m.Options)
+
+	return nil
+}
+
+func (bm *bindMounter) addExt4Mount(ctx context.Context, b *bundle.Bundle, i int, m specs.Mount) error {
+	log.G(ctx).WithField("mount", m).Debug("transforming ext4 mount into a virtio block device mount")
+
+	// Verify the source file exists
+	if _, err := os.Stat(m.Source); err != nil {
+		return fmt.Errorf("failed to stat ext4 mount source %s: %w", m.Source, err)
+	}
+
+	hash := sha256.Sum256([]byte(m.Destination))
+	tag := fmt.Sprintf("ext4-%x", hash[:8])
+	diskLetter := bm.nextDiskLetter()
+	vmDevice := fmt.Sprintf("/dev/vd%c", diskLetter)
+	vmTarget := "/mnt/" + tag
+
+	// Check if read-only is specified in options
+	readOnly := false
+	for _, opt := range m.Options {
+		if opt == "ro" {
+			readOnly = true
+			break
+		}
+	}
+
+	transformed := specMount{
+		mountType: "ext4",
+		tag:       tag,
+		hostSrc:   m.Source,
+		vmTarget:  vmTarget,
+		vmSource:  vmDevice,
+		options:   filterSpecOptions(m.Options),
+		readOnly:  readOnly,
+	}
+
+	bm.mounts = append(bm.mounts, transformed)
+	// Update the spec to use the VM target path
+	b.Spec.Mounts[i].Source = vmTarget
+	// Change the type back to bind since the ext4 will be pre-mounted in the VM
+	b.Spec.Mounts[i].Type = "bind"
+	// Remove ext4-specific options that don't apply to bind mounts
+	b.Spec.Mounts[i].Options = filterBindOptions(m.Options)
+
+	return nil
+}
+
+// filterSpecOptions filters out options that are not applicable for the
+// filesystem mount inside the VM
+func filterSpecOptions(options []string) []string {
+	var filtered []string
+	for _, o := range options {
+		switch o {
+		case "loop", "bind", "rbind", "private", "rprivate", "shared", "rshared", "slave", "rslave":
+			// Skip OCI-specific or loop mount options
+		default:
+			filtered = append(filtered, o)
+		}
+	}
+	return filtered
+}
+
+// filterBindOptions filters options to only keep those valid for bind mounts
+func filterBindOptions(options []string) []string {
+	var filtered []string
+	for _, o := range options {
+		switch o {
+		case "ro", "rw", "bind", "rbind", "private", "rprivate", "shared", "rshared", "slave", "rslave":
+			filtered = append(filtered, o)
+		}
+	}
+	// Ensure bind is present
+	hasBind := false
+	for _, o := range filtered {
+		if o == "bind" || o == "rbind" {
+			hasBind = true
+			break
+		}
+	}
+	if !hasBind {
+		filtered = append([]string{"bind"}, filtered...)
+	}
+	return filtered
+}
+
 func (bm *bindMounter) SetupVM(ctx context.Context, vmi vm.Instance) error {
 	for _, m := range bm.mounts {
-		if err := vmi.AddFS(ctx, m.tag, m.hostSrc); err != nil {
-			return err
+		switch m.mountType {
+		case "bind":
+			if err := vmi.AddFS(ctx, m.tag, m.hostSrc); err != nil {
+				return fmt.Errorf("failed to add virtiofs for bind mount %s: %w", m.tag, err)
+			}
+		case "erofs", "ext4":
+			var opts []vm.MountOpt
+			if m.readOnly {
+				opts = append(opts, vm.WithReadOnly())
+			}
+			if err := vmi.AddDisk(ctx, m.tag, m.hostSrc, opts...); err != nil {
+				return fmt.Errorf("failed to add disk for %s mount %s: %w", m.mountType, m.tag, err)
+			}
 		}
 	}
 	return nil
@@ -213,7 +413,19 @@ func (bm *bindMounter) SetupVM(ctx context.Context, vmi vm.Instance) error {
 func (bm *bindMounter) InitArgs() []string {
 	args := make([]string, 0, len(bm.mounts))
 	for _, m := range bm.mounts {
-		args = append(args, "-mount="+m.tag+":"+m.vmTarget)
+		// Format: -mount=type:source:target[:options]
+		switch m.mountType {
+		case "bind":
+			// For virtiofs bind mounts: -mount=virtiofs:tag:vmTarget
+			args = append(args, "-mount=virtiofs:"+m.tag+":"+m.vmTarget)
+		case "erofs", "ext4":
+			// For block device mounts: -mount=erofs:/dev/vdX:vmTarget[:options]
+			arg := fmt.Sprintf("-mount=%s:%s:%s", m.mountType, m.vmSource, m.vmTarget)
+			if len(m.options) > 0 {
+				arg += ":" + strings.Join(m.options, ",")
+			}
+			args = append(args, arg)
+		}
 	}
 	return args
 }

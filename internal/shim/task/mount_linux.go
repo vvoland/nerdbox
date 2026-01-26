@@ -28,7 +28,7 @@ import (
 	"github.com/containerd/nerdbox/internal/vm"
 )
 
-func setupMounts(ctx context.Context, vmi vm.Instance, id string, m []*types.Mount, rootfs, lmounts string) ([]*types.Mount, error) {
+func setupMounts(ctx context.Context, vmi vm.Instance, id string, m []*types.Mount, rootfs, lmounts string) ([]*types.Mount, byte, error) {
 	// Handle mounts
 
 	if len(m) == 1 && (m[0].Type == "overlay" || m[0].Type == "bind") {
@@ -43,17 +43,17 @@ func setupMounts(ctx context.Context, vmi vm.Instance, id string, m []*types.Mou
 			Options: m[0].Options,
 		}
 		if err := mnt.Mount(rootfs); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if err := vmi.AddFS(ctx, tag, rootfs); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		return []*types.Mount{{
 			Type:   "virtiofs",
 			Source: tag,
 			// TODO: Translate the options
 			//Options: m[0].Options,
-		}}, nil
+		}}, 0, nil
 	} else if len(m) == 0 {
 		tag := fmt.Sprintf("rootfs-%s", id)
 		// virtiofs implementation has a limit of 36 characters for the tag
@@ -61,17 +61,17 @@ func setupMounts(ctx context.Context, vmi vm.Instance, id string, m []*types.Mou
 			tag = tag[:36]
 		}
 		if err := vmi.AddFS(ctx, tag, rootfs); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		return []*types.Mount{{
 			Type:   "virtiofs",
 			Source: tag,
-		}}, nil
+		}}, 0, nil
 	}
-	mounts, err := transformMounts(ctx, vmi, id, m)
+	mounts, diskCount, err := transformMounts(ctx, vmi, id, m)
 	if err != nil && errdefs.IsNotImplemented(err) {
 		if err := mountutil.All(ctx, rootfs, lmounts, m); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 
 		// Fallback to original rootfs mount
@@ -81,12 +81,12 @@ func setupMounts(ctx context.Context, vmi vm.Instance, id string, m []*types.Mou
 			tag = tag[:36]
 		}
 		if err := vmi.AddFS(ctx, tag, rootfs); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		return []*types.Mount{{
 			Type:   "virtiofs",
 			Source: tag,
-		}}, nil
+		}}, 0, nil
 	}
-	return mounts, err
+	return mounts, diskCount, err
 }
