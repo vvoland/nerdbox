@@ -221,22 +221,21 @@ func TestErofsMountsProvider(t *testing.T) {
 		require.Len(t, bm.mounts, 1)
 		m := bm.mounts[0]
 		assert.Equal(t, "erofs", m.mountType)
-		assert.True(t, m.isBlockDevice)
-		assert.True(t, strings.HasPrefix(m.tag, "blk-"))
+		assert.True(t, strings.HasPrefix(m.tag, "erofs-"))
 		assert.Equal(t, erofsImage, m.hostSrc)
-		assert.True(t, strings.HasPrefix(m.vmTarget, "/mnt/blk-"))
+		assert.True(t, strings.HasPrefix(m.vmTarget, "/mnt/erofs-"))
 		assert.Equal(t, "/dev/vda", m.vmSource)
-		assert.False(t, m.readOnly) // read-only is determined by options, not filesystem type
+		assert.True(t, m.readOnly)
 
 		// Verify spec transformation
 		assert.Equal(t, "bind", b.Spec.Mounts[0].Type)
-		assert.True(t, strings.HasPrefix(b.Spec.Mounts[0].Source, "/mnt/blk-"))
+		assert.True(t, strings.HasPrefix(b.Spec.Mounts[0].Source, "/mnt/erofs-"))
 		assert.Contains(t, b.Spec.Mounts[0].Options, "bind")
 
 		// Verify init args
 		args := bm.InitArgs()
 		require.Len(t, args, 1)
-		assert.True(t, strings.HasPrefix(args[0], "-mount=erofs:/dev/vda:/mnt/blk-"))
+		assert.True(t, strings.HasPrefix(args[0], "-mount=erofs:/dev/vda:/mnt/erofs-"))
 	})
 
 	t.Run("multiple erofs mounts", func(t *testing.T) {
@@ -320,21 +319,20 @@ func TestExt4MountsProvider(t *testing.T) {
 		require.Len(t, bm.mounts, 1)
 		m := bm.mounts[0]
 		assert.Equal(t, "ext4", m.mountType)
-		assert.True(t, m.isBlockDevice)
-		assert.True(t, strings.HasPrefix(m.tag, "blk-"))
+		assert.True(t, strings.HasPrefix(m.tag, "ext4-"))
 		assert.Equal(t, ext4Image, m.hostSrc)
-		assert.True(t, strings.HasPrefix(m.vmTarget, "/mnt/blk-"))
+		assert.True(t, strings.HasPrefix(m.vmTarget, "/mnt/ext4-"))
 		assert.Equal(t, "/dev/vda", m.vmSource)
 		assert.False(t, m.readOnly) // ext4 is read-write by default
 
 		// Verify spec transformation
 		assert.Equal(t, "bind", b.Spec.Mounts[0].Type)
-		assert.True(t, strings.HasPrefix(b.Spec.Mounts[0].Source, "/mnt/blk-"))
+		assert.True(t, strings.HasPrefix(b.Spec.Mounts[0].Source, "/mnt/ext4-"))
 
 		// Verify init args
 		args := bm.InitArgs()
 		require.Len(t, args, 1)
-		assert.True(t, strings.HasPrefix(args[0], "-mount=ext4:/dev/vda:/mnt/blk-"))
+		assert.True(t, strings.HasPrefix(args[0], "-mount=ext4:/dev/vda:/mnt/ext4-"))
 	})
 
 	t.Run("ext4 mount with ro option", func(t *testing.T) {
