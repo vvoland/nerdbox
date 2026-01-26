@@ -62,10 +62,7 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 		err      error
 	)
 
-	// mdir is used for intermediate mount points in the VM
-	const mdir = "/run/containerd/mounts"
-
-	for i, m := range ms {
+	for _, m := range ms {
 		mountType := m.Type
 
 		// Handle mkfs/ prefix - create filesystem on the source image
@@ -94,20 +91,6 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 			}
 		}
 
-		// Determine the mount point for this mount.
-		// Intermediate mounts (not the last one) get a temporary mount point.
-		// The last mount uses the rootfs target.
-		var mountPoint string
-		if m.Target != "" {
-			mountPoint = m.Target
-		} else if i < len(ms)-1 {
-			// Intermediate mount - assign a temporary mount point in the VM
-			mountPoint = fmt.Sprintf("%s/%d", mdir, i)
-		} else {
-			// Last mount without explicit target - this will be the rootfs
-			mountPoint = "/rootfs"
-		}
-
 		switch mountType {
 		case "erofs":
 			disk := fmt.Sprintf("disk-%c-%s", disks, id)
@@ -123,13 +106,13 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 			vmMount := &types.Mount{
 				Type:    "erofs",
 				Source:  fmt.Sprintf("/dev/vd%c", disks),
-				Target:  mountPoint,
+				Target:  m.Target,
 				Options: filterOptions(m.Options),
 			}
 			am = append(am, vmMount)
 			active = append(active, activeMount{
 				Source:     m.Source,
-				MountPoint: mountPoint,
+				MountPoint: m.Target,
 			})
 			disks++
 		case "ext4":
@@ -147,13 +130,13 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 			vmMount := &types.Mount{
 				Type:    "ext4",
 				Source:  fmt.Sprintf("/dev/vd%c", disks),
-				Target:  mountPoint,
+				Target:  m.Target,
 				Options: filterOptions(m.Options),
 			}
 			am = append(am, vmMount)
 			active = append(active, activeMount{
 				Source:     m.Source,
-				MountPoint: mountPoint,
+				MountPoint: m.Target,
 			})
 			disks++
 		case "overlay":
@@ -161,11 +144,11 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 				wdi = -1
 				udi = -1
 			)
-			for j, opt := range m.Options {
+			for i, opt := range m.Options {
 				if strings.HasPrefix(opt, "upperdir=") {
-					udi = j
+					udi = i
 				} else if strings.HasPrefix(opt, "workdir=") {
-					wdi = j
+					wdi = i
 				}
 				// TODO: Handle virtio for lowers?
 			}
@@ -185,42 +168,23 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 				log.G(ctx).WithField("options", m.Options).Warnf("overlayfs missing workdir or upperdir")
 			}
 
-			// Set the target for the overlay mount
-			resultMount := &types.Mount{
-				Type:    m.Type,
-				Source:  m.Source,
-				Target:  mountPoint,
-				Options: m.Options,
-			}
-			am = append(am, resultMount)
+			am = append(am, m)
 			active = append(active, activeMount{
 				Source:     m.Source,
-				MountPoint: mountPoint,
+				MountPoint: m.Target,
 			})
 		case "bind":
 			// Pass bind mounts through to the VM for processing
-			resultMount := &types.Mount{
-				Type:    m.Type,
-				Source:  m.Source,
-				Target:  mountPoint,
-				Options: m.Options,
-			}
-			am = append(am, resultMount)
+			am = append(am, m)
 			active = append(active, activeMount{
 				Source:     m.Source,
-				MountPoint: mountPoint,
+				MountPoint: m.Target,
 			})
 		default:
-			resultMount := &types.Mount{
-				Type:    m.Type,
-				Source:  m.Source,
-				Target:  mountPoint,
-				Options: m.Options,
-			}
-			am = append(am, resultMount)
+			am = append(am, m)
 			active = append(active, activeMount{
 				Source:     m.Source,
-				MountPoint: mountPoint,
+				MountPoint: m.Target,
 			})
 		}
 	}
