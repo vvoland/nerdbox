@@ -17,12 +17,16 @@
 package task
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"text/template"
 
 	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/errdefs"
@@ -38,6 +42,15 @@ type diskOptions struct {
 	readOnly bool
 }
 
+// activeMount tracks a mount that has been processed and can be referenced
+// by subsequent mounts via templating.
+type activeMount struct {
+	// Source is the original source path
+	Source string
+	// MountPoint is where this mount is accessible in the VM
+	MountPoint string
+}
+
 // transformMounts does not perform any local mounts but transforms
 // the mounts to be used inside the VM via virtio
 func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*types.Mount) ([]*types.Mount, error) {
@@ -45,13 +58,42 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 		disks    byte = 'a'
 		addDisks []diskOptions
 		am       []*types.Mount
+		active   []activeMount
 		err      error
 	)
 
 	for _, m := range ms {
-		switch m.Type {
+		mountType := m.Type
+
+		// Handle mkfs/ prefix - create filesystem on the source image
+		if t, ok := strings.CutPrefix(mountType, "mkfs/"); ok {
+			mountType = t
+			if err := runMkfs(ctx, t, m.Source, m.Options); err != nil {
+				return nil, fmt.Errorf("mkfs %s on %s: %w", t, m.Source, err)
+			}
+		}
+
+		// Handle format/ prefix - expand templates in source, target, and options
+		if t, ok := strings.CutPrefix(mountType, "format/"); ok {
+			mountType = t
+			m, err = formatMount(m, active)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Handle mkdir/ prefix - create directories specified in options
+		if t, ok := strings.CutPrefix(mountType, "mkdir/"); ok {
+			mountType = t
+			m, err = mkdirMount(m)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		switch mountType {
 		case "erofs":
-			disk := fmt.Sprintf("disk-%d-%s", disks, id)
+			disk := fmt.Sprintf("disk-%c-%s", disks, id)
 			// virtiofs implementation has a limit of 36 characters for the tag
 			if len(disk) > 36 {
 				disk = disk[:36]
@@ -61,15 +103,20 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 				source:   m.Source,
 				readOnly: true,
 			})
-			am = append(am, &types.Mount{
+			vmMount := &types.Mount{
 				Type:    "erofs",
 				Source:  fmt.Sprintf("/dev/vd%c", disks),
 				Target:  m.Target,
 				Options: filterOptions(m.Options),
+			}
+			am = append(am, vmMount)
+			active = append(active, activeMount{
+				Source:     m.Source,
+				MountPoint: m.Target,
 			})
 			disks++
 		case "ext4":
-			disk := fmt.Sprintf("disk-%d-%s", disks, id)
+			disk := fmt.Sprintf("disk-%c-%s", disks, id)
 			// virtiofs implementation has a limit of 36 characters for the tag
 			if len(disk) > 36 {
 				disk = disk[:36]
@@ -80,14 +127,19 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 				source:   m.Source,
 				readOnly: false,
 			})
-			am = append(am, &types.Mount{
+			vmMount := &types.Mount{
 				Type:    "ext4",
 				Source:  fmt.Sprintf("/dev/vd%c", disks),
 				Target:  m.Target,
 				Options: filterOptions(m.Options),
+			}
+			am = append(am, vmMount)
+			active = append(active, activeMount{
+				Source:     m.Source,
+				MountPoint: m.Target,
 			})
 			disks++
-		case "overlay", "format/overlay", "format/mkdir/overlay":
+		case "overlay":
 			var (
 				wdi = -1
 				udi = -1
@@ -117,8 +169,23 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 			}
 
 			am = append(am, m)
+			active = append(active, activeMount{
+				Source:     m.Source,
+				MountPoint: m.Target,
+			})
+		case "bind":
+			// Pass bind mounts through to the VM for processing
+			am = append(am, m)
+			active = append(active, activeMount{
+				Source:     m.Source,
+				MountPoint: m.Target,
+			})
 		default:
 			am = append(am, m)
+			active = append(active, activeMount{
+				Source:     m.Source,
+				MountPoint: m.Target,
+			})
 		}
 	}
 
@@ -137,6 +204,194 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 	}
 
 	return am, err
+}
+
+// runMkfs runs mkfs for the given filesystem type on the source file.
+func runMkfs(ctx context.Context, fsType, source string, options []string) error {
+	// Parse mkfs options from mount options
+	var mkfsArgs []string
+	for _, opt := range options {
+		if strings.HasPrefix(opt, "X-containerd.mkfs.") {
+			switch {
+			case strings.HasPrefix(opt, "X-containerd.mkfs.size="):
+				// Size is used to create the file, not passed to mkfs
+				sizeStr := strings.TrimPrefix(opt, "X-containerd.mkfs.size=")
+				size, err := strconv.ParseInt(sizeStr, 10, 64)
+				if err != nil {
+					return fmt.Errorf("invalid mkfs size %q: %w", sizeStr, err)
+				}
+				// Create the file with the specified size if it doesn't exist
+				if _, err := os.Stat(source); os.IsNotExist(err) {
+					f, err := os.Create(source)
+					if err != nil {
+						return fmt.Errorf("creating image file: %w", err)
+					}
+					if err := f.Truncate(size); err != nil {
+						f.Close()
+						return fmt.Errorf("truncating image file to size %d: %w", size, err)
+					}
+					f.Close()
+				}
+			case strings.HasPrefix(opt, "X-containerd.mkfs.fs="):
+				// This specifies the filesystem type, already handled
+			default:
+				// Unknown mkfs option, skip
+				log.G(ctx).WithField("option", opt).Warn("unknown mkfs option")
+			}
+		}
+	}
+
+	// Check if the file already has a filesystem
+	if hasFilesystem(source) {
+		log.G(ctx).WithField("source", source).Debug("source already has filesystem, skipping mkfs")
+		return nil
+	}
+
+	// Run mkfs
+	mkfsCmd := fmt.Sprintf("mkfs.%s", fsType)
+	mkfsArgs = append(mkfsArgs, source)
+
+	log.G(ctx).WithFields(log.Fields{
+		"cmd":    mkfsCmd,
+		"args":   mkfsArgs,
+		"source": source,
+	}).Debug("running mkfs")
+
+	cmd := exec.CommandContext(ctx, mkfsCmd, mkfsArgs...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("mkfs.%s failed: %w, output: %s", fsType, err, string(output))
+	}
+
+	return nil
+}
+
+// hasFilesystem checks if the file already has a filesystem.
+func hasFilesystem(source string) bool {
+	cmd := exec.Command("blkid", source)
+	err := cmd.Run()
+	return err == nil
+}
+
+// formatMount expands templates in the mount's source, target, and options.
+func formatMount(m *types.Mount, active []activeMount) (*types.Mount, error) {
+	result := &types.Mount{
+		Type:    m.Type,
+		Source:  m.Source,
+		Target:  m.Target,
+		Options: make([]string, len(m.Options)),
+	}
+	copy(result.Options, m.Options)
+
+	// Expand templates in options
+	for i, opt := range result.Options {
+		if expanded, err := expandTemplate(opt, active); err != nil {
+			return nil, fmt.Errorf("formatting mount option %q: %w", opt, err)
+		} else {
+			result.Options[i] = expanded
+		}
+	}
+
+	// Expand template in source
+	if expanded, err := expandTemplate(result.Source, active); err != nil {
+		return nil, fmt.Errorf("formatting mount source %q: %w", result.Source, err)
+	} else {
+		result.Source = expanded
+	}
+
+	// Expand template in target
+	if expanded, err := expandTemplate(result.Target, active); err != nil {
+		return nil, fmt.Errorf("formatting mount target %q: %w", result.Target, err)
+	} else {
+		result.Target = expanded
+	}
+
+	return result, nil
+}
+
+// mkdirMount processes mkdir options and creates directories.
+func mkdirMount(m *types.Mount) (*types.Mount, error) {
+	result := &types.Mount{
+		Type:   m.Type,
+		Source: m.Source,
+		Target: m.Target,
+	}
+
+	var options []string
+	for _, opt := range m.Options {
+		if strings.HasPrefix(opt, "X-containerd.mkdir.") {
+			prefix := "X-containerd.mkdir.path="
+			if !strings.HasPrefix(opt, prefix) {
+				return nil, fmt.Errorf("unknown mkdir mount option %q", opt)
+			}
+			parts := strings.SplitN(opt[len(prefix):], ":", 4)
+			if len(parts) >= 1 {
+				dir := parts[0]
+				// Note: Unlike mountutil.All, we don't restrict the path here
+				// because we're creating directories that will be used in the VM
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					return nil, fmt.Errorf("mkdir %s: %w", dir, err)
+				}
+			}
+		} else {
+			options = append(options, opt)
+		}
+	}
+	result.Options = options
+
+	return result, nil
+}
+
+// expandTemplate expands template strings like {{ mount 0 }} using active mounts.
+func expandTemplate(s string, active []activeMount) (string, error) {
+	if !strings.Contains(s, "{{") {
+		return s, nil
+	}
+
+	fm := template.FuncMap{
+		"source": func(i int) (string, error) {
+			if i < 0 || i >= len(active) {
+				return "", fmt.Errorf("index out of bounds: %d, has %d active mounts", i, len(active))
+			}
+			return active[i].Source, nil
+		},
+		"mount": func(i int) (string, error) {
+			if i < 0 || i >= len(active) {
+				return "", fmt.Errorf("index out of bounds: %d, has %d active mounts", i, len(active))
+			}
+			return active[i].MountPoint, nil
+		},
+		"overlay": func(start, end int) (string, error) {
+			var dirs []string
+			if start > end {
+				if start >= len(active) || end < 0 {
+					return "", fmt.Errorf("invalid range: %d-%d, has %d active mounts", start, end, len(active))
+				}
+				for i := start; i >= end; i-- {
+					dirs = append(dirs, active[i].MountPoint)
+				}
+			} else {
+				if start < 0 || end >= len(active) {
+					return "", fmt.Errorf("invalid range: %d-%d, has %d active mounts", start, end, len(active))
+				}
+				for i := start; i <= end; i++ {
+					dirs = append(dirs, active[i].MountPoint)
+				}
+			}
+			return strings.Join(dirs, ":"), nil
+		},
+	}
+
+	t, err := template.New("").Funcs(fm).Parse(s)
+	if err != nil {
+		return "", err
+	}
+
+	buf := bytes.NewBuffer(nil)
+	if err := t.Execute(buf, nil); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }
 
 func filterOptions(options []string) []string {
