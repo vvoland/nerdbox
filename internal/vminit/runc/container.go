@@ -93,6 +93,19 @@ func NewContainer(ctx context.Context, platform stdio.Platform, r *task.CreateTa
 		return nil, err
 	}
 
+	// Process OCI spec mounts that have special types (format/, mkdir/, etc.)
+	// This must be done before mounting rootfs since some spec mounts may
+	// reference block devices that need to be mounted first.
+	specMountCleanup, err := processSpecMounts(ctx, r.Bundle)
+	if err != nil {
+		return nil, fmt.Errorf("processing spec mounts: %w", err)
+	}
+	defer func() {
+		if retErr != nil && specMountCleanup != nil {
+			specMountCleanup()
+		}
+	}()
+
 	if len(r.Rootfs) != 0 && (len(r.Rootfs) != 1 || r.Rootfs[0].Type != "bind" || r.Rootfs[0].Source != rootfs) {
 		log.G(ctx).WithField("mounts", r.Rootfs).Debugf("mounting rootfs components")
 		mdir := filepath.Join(r.Bundle, "mounts")
@@ -123,6 +136,7 @@ func NewContainer(ctx context.Context, platform stdio.Platform, r *task.CreateTa
 		process:         p,
 		processes:       make(map[string]process.Process),
 		reservedProcess: make(map[string]struct{}),
+		specMountCleanup: specMountCleanup,
 	}
 	pid := p.Pid()
 	if pid > 0 {
@@ -206,6 +220,10 @@ type Container struct {
 	process         process.Process
 	processes       map[string]process.Process
 	reservedProcess map[string]struct{}
+
+	// specMountCleanup is called to clean up any mounts set up during
+	// OCI spec mount processing.
+	specMountCleanup func()
 }
 
 // All processes in the container
@@ -337,6 +355,12 @@ func (c *Container) Delete(ctx context.Context, r *task.DeleteRequest) (process.
 	}
 	if r.ExecID != "" {
 		c.ProcessRemove(r.ExecID)
+	} else {
+		// Deleting the init process - cleanup spec mounts
+		if c.specMountCleanup != nil {
+			c.specMountCleanup()
+			c.specMountCleanup = nil
+		}
 	}
 	return p, nil
 }

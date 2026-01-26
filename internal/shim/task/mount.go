@@ -49,7 +49,14 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 	)
 
 	for _, m := range ms {
-		switch m.Type {
+		// Handle mkfs/<fstype> prefix - strip it and keep the fstype
+		// The mkfs operation is done by the snapshotter on the host
+		mountType := m.Type
+		if strings.HasPrefix(mountType, "mkfs/") {
+			mountType = strings.TrimPrefix(mountType, "mkfs/")
+		}
+
+		switch mountType {
 		case "erofs":
 			disk := fmt.Sprintf("disk-%d-%s", disks, id)
 			// virtiofs implementation has a limit of 36 characters for the tag
@@ -142,8 +149,11 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 func filterOptions(options []string) []string {
 	var filtered []string
 	for _, o := range options {
-		switch o {
-		case "loop":
+		switch {
+		case o == "loop":
+			// Skip loop option - not needed for virtio block devices
+		case strings.HasPrefix(o, "X-containerd.mkfs."):
+			// Skip mkfs options - these are for the snapshotter, not the mount
 		default:
 			filtered = append(filtered, o)
 		}
