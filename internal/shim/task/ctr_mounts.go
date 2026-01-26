@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 
@@ -76,14 +77,29 @@ func (t *ctrMountTransformer) SetStartingDiskLetter(letter byte) {
 // need transformation for VM execution. It collects information but does NOT
 // modify the spec yet - that happens in SetupVM when we know the disk letters.
 func (t *ctrMountTransformer) FromBundle(ctx context.Context, b *bundle.Bundle) error {
+	log.G(ctx).WithField("numMounts", len(b.Spec.Mounts)).Debug("ctrMountTransformer.FromBundle processing spec mounts")
+
 	for i := range b.Spec.Mounts {
 		m := &b.Spec.Mounts[i]
+
+		log.G(ctx).WithFields(log.Fields{
+			"index":       i,
+			"type":        m.Type,
+			"source":      m.Source,
+			"destination": m.Destination,
+		}).Debug("examining spec mount")
 
 		transform, err := t.processCtrMount(ctx, i, m)
 		if err != nil {
 			return fmt.Errorf("processing mount %q: %w", m.Destination, err)
 		}
 		if transform != nil {
+			log.G(ctx).WithFields(log.Fields{
+				"index":          i,
+				"destination":    m.Destination,
+				"originalSource": transform.originalSource,
+				"fsType":         transform.fsType,
+			}).Debug("mount requires transformation")
 			t.transforms = append(t.transforms, *transform)
 		}
 	}
@@ -147,7 +163,12 @@ func (t *ctrMountTransformer) SetupVM(ctx context.Context, vmi vm.Instance) erro
 		t.diskLetter = 'a'
 	}
 
-	for _, transform := range t.transforms {
+	log.G(ctx).WithFields(log.Fields{
+		"startingDiskLetter": string(t.diskLetter),
+		"numTransforms":      len(t.transforms),
+	}).Debug("ctrMountTransformer.SetupVM starting")
+
+	for i, transform := range t.transforms {
 		// Create a unique disk name based on the destination
 		hash := sha256.Sum256([]byte(transform.specMount.Destination))
 		diskName := fmt.Sprintf("ctr-%c-%x", t.diskLetter, hash[:4])
@@ -159,11 +180,27 @@ func (t *ctrMountTransformer) SetupVM(ctx context.Context, vmi vm.Instance) erro
 		// The device path inside the VM
 		vmDevicePath := fmt.Sprintf("/dev/vd%c", t.diskLetter)
 
+		// Check if source file exists
+		if fi, err := os.Stat(transform.originalSource); err != nil {
+			log.G(ctx).WithError(err).WithFields(log.Fields{
+				"source": transform.originalSource,
+			}).Error("source file for disk does not exist")
+			return fmt.Errorf("source file %q does not exist: %w", transform.originalSource, err)
+		} else {
+			log.G(ctx).WithFields(log.Fields{
+				"source": transform.originalSource,
+				"size":   fi.Size(),
+				"mode":   fi.Mode(),
+			}).Debug("source file exists")
+		}
+
 		log.G(ctx).WithFields(log.Fields{
+			"index":        i,
 			"diskName":     diskName,
 			"source":       transform.originalSource,
 			"vmDevicePath": vmDevicePath,
 			"readOnly":     transform.readOnly,
+			"destination":  transform.specMount.Destination,
 		}).Debug("adding block device for container mount")
 
 		var opts []vm.MountOpt
@@ -172,7 +209,12 @@ func (t *ctrMountTransformer) SetupVM(ctx context.Context, vmi vm.Instance) erro
 		}
 
 		if err := vmi.AddDisk(ctx, diskName, transform.originalSource, opts...); err != nil {
-			return fmt.Errorf("adding disk %s: %w", diskName, err)
+			log.G(ctx).WithError(err).WithFields(log.Fields{
+				"diskName":    diskName,
+				"source":      transform.originalSource,
+				"destination": transform.specMount.Destination,
+			}).Error("failed to add disk to VM")
+			return fmt.Errorf("adding disk %s (source=%s, dest=%s): %w", diskName, transform.originalSource, transform.specMount.Destination, err)
 		}
 
 		// Now update the mount in the spec to use the VM device path.

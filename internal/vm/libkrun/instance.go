@@ -176,8 +176,19 @@ func (v *vmInstance) AddDisk(ctx context.Context, blockID, mountPath string, opt
 		o(&mc)
 	}
 
+	log.G(ctx).WithFields(log.Fields{
+		"blockID":   blockID,
+		"mountPath": mountPath,
+		"readOnly":  mc.Readonly,
+	}).Debug("calling krun_add_disk")
+
 	if err := v.vmc.AddDisk(blockID, mountPath, mc.Readonly); err != nil {
-		return fmt.Errorf("failed to add disk at '%s': %w", mountPath, err)
+		log.G(ctx).WithError(err).WithFields(log.Fields{
+			"blockID":   blockID,
+			"mountPath": mountPath,
+			"readOnly":  mc.Readonly,
+		}).Error("krun_add_disk failed")
+		return fmt.Errorf("failed to add disk blockID=%q path=%q readonly=%v: %w", blockID, mountPath, mc.Readonly, err)
 	}
 
 	return nil

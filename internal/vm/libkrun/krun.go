@@ -151,7 +151,7 @@ func (vmc *vmcontext) AddDisk(blockID, path string, readonly bool) error {
 	}
 	ret := vmc.lib.AddDisk(vmc.ctxID, blockID, path, readonly)
 	if ret != 0 {
-		return fmt.Errorf("krun_add_disk failed: %d", ret)
+		return fmt.Errorf("krun_add_disk failed with code %d (blockID=%q, path=%q, readonly=%v)", ret, blockID, path, readonly)
 	}
 	return nil
 }
