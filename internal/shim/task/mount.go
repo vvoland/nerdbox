@@ -36,6 +36,7 @@ import (
 type diskOptions struct {
 	name     string
 	source   string
+	fsType   string
 	readOnly bool
 }
 
@@ -52,43 +53,6 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 
 	for _, m := range ms {
 		switch m.Type {
-		case "erofs":
-			disk := fmt.Sprintf("disk-%d-%s", disks, id)
-			// virtiofs implementation has a limit of 36 characters for the tag
-			if len(disk) > 36 {
-				disk = disk[:36]
-			}
-			addDisks = append(addDisks, diskOptions{
-				name:     disk,
-				source:   m.Source,
-				readOnly: true,
-			})
-			am = append(am, &types.Mount{
-				Type:    "erofs",
-				Source:  fmt.Sprintf("/dev/vd%c", disks),
-				Target:  m.Target,
-				Options: filterOptions(m.Options),
-			})
-			disks++
-		case "ext4":
-			disk := fmt.Sprintf("disk-%d-%s", disks, id)
-			// virtiofs implementation has a limit of 36 characters for the tag
-			if len(disk) > 36 {
-				disk = disk[:36]
-			}
-			// TODO: Check read only option
-			addDisks = append(addDisks, diskOptions{
-				name:     disk,
-				source:   m.Source,
-				readOnly: false,
-			})
-			am = append(am, &types.Mount{
-				Type:    "ext4",
-				Source:  fmt.Sprintf("/dev/vd%c", disks),
-				Target:  m.Target,
-				Options: filterOptions(m.Options),
-			})
-			disks++
 		case "overlay", "format/overlay", "format/mkdir/overlay":
 			var (
 				wdi = -1
@@ -120,7 +84,31 @@ func transformMounts(ctx context.Context, vmi vm.Instance, id string, ms []*type
 
 			am = append(am, m)
 		default:
-			am = append(am, m)
+			// Check if source is a file - if so, treat as block device mount
+			if fi, err := os.Stat(m.Source); err == nil && !fi.IsDir() {
+				disk := fmt.Sprintf("disk-%d-%s", disks, id)
+				// virtiofs implementation has a limit of 36 characters for the tag
+				if len(disk) > 36 {
+					disk = disk[:36]
+				}
+				// Check if read-only is specified in options
+				readOnly := hasReadOnlyOption(m.Options)
+				addDisks = append(addDisks, diskOptions{
+					name:     disk,
+					source:   m.Source,
+					fsType:   m.Type,
+					readOnly: readOnly,
+				})
+				am = append(am, &types.Mount{
+					Type:    m.Type,
+					Source:  fmt.Sprintf("/dev/vd%c", disks),
+					Target:  m.Target,
+					Options: filterOptions(m.Options),
+				})
+				disks++
+			} else {
+				am = append(am, m)
+			}
 		}
 	}
 
@@ -155,14 +143,24 @@ func filterOptions(options []string) []string {
 	return filtered
 }
 
+func hasReadOnlyOption(options []string) bool {
+	for _, opt := range options {
+		if opt == "ro" {
+			return true
+		}
+	}
+	return false
+}
+
 // specMount represents a mount from the OCI spec that needs VM setup.
 // It supports different mount types:
 //   - bind: transformed to virtiofs shares
-//   - erofs: passed as virtio block devices (read-only)
-//   - ext4: passed as virtio block devices
+//   - block device filesystems (ext4, erofs, xfs, etc.): passed as virtio block devices
 type specMount struct {
-	// mountType is the original mount type from the OCI spec (bind, erofs, ext4)
+	// mountType is the original mount type from the OCI spec (bind, or filesystem type)
 	mountType string
+	// isBlockDevice indicates this is a block device backed filesystem
+	isBlockDevice bool
 	// tag is the virtio-fs tag (for bind mounts) or disk identifier
 	tag string
 	// hostSrc is the source path on the host
@@ -194,7 +192,7 @@ func (bm *bindMounter) SetDiskOffset(offset byte) {
 func (bm *bindMounter) DiskCount() byte {
 	count := byte(0)
 	for _, m := range bm.mounts {
-		if m.mountType == "erofs" || m.mountType == "ext4" {
+		if m.isBlockDevice {
 			count++
 		}
 	}
@@ -224,13 +222,12 @@ func (bm *bindMounter) FromBundle(ctx context.Context, b *bundle.Bundle) error {
 			if err := bm.addBindMount(ctx, b, i, m); err != nil {
 				return err
 			}
-		case "erofs":
-			if err := bm.addErofsMount(ctx, b, i, m); err != nil {
-				return err
-			}
-		case "ext4":
-			if err := bm.addExt4Mount(ctx, b, i, m); err != nil {
-				return err
+		default:
+			// Check if source is a file - if so, treat as block device mount
+			if fi, err := os.Stat(m.Source); err == nil && !fi.IsDir() {
+				if err := bm.addBlockDeviceMount(ctx, b, i, m, mountType); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -273,80 +270,35 @@ func (bm *bindMounter) addBindMount(ctx context.Context, b *bundle.Bundle, i int
 	return nil
 }
 
-func (bm *bindMounter) addErofsMount(ctx context.Context, b *bundle.Bundle, i int, m specs.Mount) error {
-	log.G(ctx).WithField("mount", m).Debug("transforming erofs mount into a virtio block device mount")
-
-	// Verify the source file exists
-	if _, err := os.Stat(m.Source); err != nil {
-		return fmt.Errorf("failed to stat erofs mount source %s: %w", m.Source, err)
-	}
+// addBlockDeviceMount handles any filesystem type backed by a block device (image file).
+// This includes ext4, erofs, xfs, btrfs, squashfs, and any other filesystem
+// that can be mounted from an image file.
+func (bm *bindMounter) addBlockDeviceMount(ctx context.Context, b *bundle.Bundle, i int, m specs.Mount, fsType string) error {
+	log.G(ctx).WithField("mount", m).WithField("fsType", fsType).Debug("transforming block device mount")
 
 	hash := sha256.Sum256([]byte(m.Destination))
-	tag := fmt.Sprintf("erofs-%x", hash[:8])
+	tag := fmt.Sprintf("blk-%x", hash[:8])
 	diskLetter := bm.nextDiskLetter()
 	vmDevice := fmt.Sprintf("/dev/vd%c", diskLetter)
 	vmTarget := "/mnt/" + tag
 
 	transformed := specMount{
-		mountType: "erofs",
-		tag:       tag,
-		hostSrc:   m.Source,
-		vmTarget:  vmTarget,
-		vmSource:  vmDevice,
-		options:   filterSpecOptions(m.Options),
-		readOnly:  true,
+		mountType:     fsType,
+		isBlockDevice: true,
+		tag:           tag,
+		hostSrc:       m.Source,
+		vmTarget:      vmTarget,
+		vmSource:      vmDevice,
+		options:       filterSpecOptions(m.Options),
+		readOnly:      hasReadOnlyOption(m.Options),
 	}
 
 	bm.mounts = append(bm.mounts, transformed)
 	// Update the spec to use the VM target path
 	b.Spec.Mounts[i].Source = vmTarget
-	// Change the type back to bind since the erofs will be pre-mounted in the VM
+	// Change the type back to bind since the filesystem will be pre-mounted in the VM
 	b.Spec.Mounts[i].Type = "bind"
-	// Remove erofs-specific options that don't apply to bind mounts
-	b.Spec.Mounts[i].Options = filterBindOptions(m.Options)
-
-	return nil
-}
-
-func (bm *bindMounter) addExt4Mount(ctx context.Context, b *bundle.Bundle, i int, m specs.Mount) error {
-	log.G(ctx).WithField("mount", m).Debug("transforming ext4 mount into a virtio block device mount")
-
-	// Verify the source file exists
-	if _, err := os.Stat(m.Source); err != nil {
-		return fmt.Errorf("failed to stat ext4 mount source %s: %w", m.Source, err)
-	}
-
-	hash := sha256.Sum256([]byte(m.Destination))
-	tag := fmt.Sprintf("ext4-%x", hash[:8])
-	diskLetter := bm.nextDiskLetter()
-	vmDevice := fmt.Sprintf("/dev/vd%c", diskLetter)
-	vmTarget := "/mnt/" + tag
-
-	// Check if read-only is specified in options
-	readOnly := false
-	for _, opt := range m.Options {
-		if opt == "ro" {
-			readOnly = true
-			break
-		}
-	}
-
-	transformed := specMount{
-		mountType: "ext4",
-		tag:       tag,
-		hostSrc:   m.Source,
-		vmTarget:  vmTarget,
-		vmSource:  vmDevice,
-		options:   filterSpecOptions(m.Options),
-		readOnly:  readOnly,
-	}
-
-	bm.mounts = append(bm.mounts, transformed)
-	// Update the spec to use the VM target path
-	b.Spec.Mounts[i].Source = vmTarget
-	// Change the type back to bind since the ext4 will be pre-mounted in the VM
-	b.Spec.Mounts[i].Type = "bind"
-	// Remove ext4-specific options that don't apply to bind mounts
+	// Remove filesystem-specific options that don't apply to bind mounts
 	b.Spec.Mounts[i].Options = filterBindOptions(m.Options)
 
 	return nil
@@ -392,18 +344,18 @@ func filterBindOptions(options []string) []string {
 
 func (bm *bindMounter) SetupVM(ctx context.Context, vmi vm.Instance) error {
 	for _, m := range bm.mounts {
-		switch m.mountType {
-		case "bind":
-			if err := vmi.AddFS(ctx, m.tag, m.hostSrc); err != nil {
-				return fmt.Errorf("failed to add virtiofs for bind mount %s: %w", m.tag, err)
-			}
-		case "erofs", "ext4":
+		if m.isBlockDevice {
 			var opts []vm.MountOpt
 			if m.readOnly {
 				opts = append(opts, vm.WithReadOnly())
 			}
 			if err := vmi.AddDisk(ctx, m.tag, m.hostSrc, opts...); err != nil {
 				return fmt.Errorf("failed to add disk for %s mount %s: %w", m.mountType, m.tag, err)
+			}
+		} else {
+			// bind mount via virtiofs
+			if err := vmi.AddFS(ctx, m.tag, m.hostSrc); err != nil {
+				return fmt.Errorf("failed to add virtiofs for bind mount %s: %w", m.tag, err)
 			}
 		}
 	}
@@ -414,17 +366,16 @@ func (bm *bindMounter) InitArgs() []string {
 	args := make([]string, 0, len(bm.mounts))
 	for _, m := range bm.mounts {
 		// Format: -mount=type:source:target[:options]
-		switch m.mountType {
-		case "bind":
-			// For virtiofs bind mounts: -mount=virtiofs:tag:vmTarget
-			args = append(args, "-mount=virtiofs:"+m.tag+":"+m.vmTarget)
-		case "erofs", "ext4":
-			// For block device mounts: -mount=erofs:/dev/vdX:vmTarget[:options]
+		if m.isBlockDevice {
+			// For block device mounts: -mount=fstype:/dev/vdX:vmTarget[:options]
 			arg := fmt.Sprintf("-mount=%s:%s:%s", m.mountType, m.vmSource, m.vmTarget)
 			if len(m.options) > 0 {
 				arg += ":" + strings.Join(m.options, ",")
 			}
 			args = append(args, arg)
+		} else {
+			// For virtiofs bind mounts: -mount=virtiofs:tag:vmTarget
+			args = append(args, "-mount=virtiofs:"+m.tag+":"+m.vmTarget)
 		}
 	}
 	return args
