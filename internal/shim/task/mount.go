@@ -211,6 +211,12 @@ func (bm *bindMounter) nextDiskLetter() byte {
 
 func (bm *bindMounter) FromBundle(ctx context.Context, b *bundle.Bundle) error {
 	for i, m := range b.Spec.Mounts {
+		// Skip mounts with template placeholders - they will be resolved VM-side
+		if hasTemplatePlaceholder(m.Source) {
+			log.G(ctx).WithField("mount", m).Debug("skipping mount with template placeholder in source")
+			continue
+		}
+
 		mountType := m.Type
 		// Strip format/ prefix - format transformations are handled VM-side
 		mountType = strings.TrimPrefix(mountType, "format/")
@@ -233,6 +239,11 @@ func (bm *bindMounter) FromBundle(ctx context.Context, b *bundle.Bundle) error {
 	}
 
 	return nil
+}
+
+// hasTemplatePlaceholder checks if a path contains template placeholders like {{ mount X }}
+func hasTemplatePlaceholder(path string) bool {
+	return strings.Contains(path, "{{")
 }
 
 func (bm *bindMounter) addBindMount(ctx context.Context, b *bundle.Bundle, i int, m specs.Mount) error {

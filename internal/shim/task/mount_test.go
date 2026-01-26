@@ -505,6 +505,34 @@ func TestDiskOffset(t *testing.T) {
 	})
 }
 
+func TestBindMountWithTemplatePlaceholder(t *testing.T) {
+	// Test that bind mounts with template placeholders are skipped
+	// (they get resolved VM-side)
+	b := &bundle.Bundle{
+		Spec: specs.Spec{
+			Mounts: []specs.Mount{
+				{Type: "bind", Source: "{{ mount 0 }}/upper", Destination: "/data", Options: []string{"rw", "rbind"}},
+				{Type: "format/mkdir/bind", Source: "{{ mount 0 }}/config", Destination: "/config", Options: []string{"ro", "rbind"}},
+			},
+		},
+	}
+
+	bm := &bindMounter{}
+	err := bm.FromBundle(context.Background(), b)
+	require.NoError(t, err)
+
+	// No mounts should be added - they all have template placeholders
+	assert.Len(t, bm.mounts, 0)
+
+	// The spec should remain unchanged
+	assert.Equal(t, "{{ mount 0 }}/upper", b.Spec.Mounts[0].Source)
+	assert.Equal(t, "{{ mount 0 }}/config", b.Spec.Mounts[1].Source)
+
+	// Init args should be empty
+	args := bm.InitArgs()
+	assert.Len(t, args, 0)
+}
+
 func TestFilterSpecOptions(t *testing.T) {
 	testcases := []struct {
 		name    string
