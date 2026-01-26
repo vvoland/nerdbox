@@ -19,6 +19,7 @@ package task
 import (
 	"context"
 	"net"
+	"os"
 	"testing"
 
 	"github.com/containerd/ttrpc"
@@ -179,18 +180,31 @@ func TestCtrMountTransformerReadOnly(t *testing.T) {
 }
 
 func TestCtrMountTransformerDiskLetterProgression(t *testing.T) {
+	// Create temporary files to simulate existing disk images
+	tmpDir := t.TempDir()
+	data1Path := tmpDir + "/data1.img"
+	data2Path := tmpDir + "/data2.img"
+
+	// Create empty files
+	if err := os.WriteFile(data1Path, []byte{}, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(data2Path, []byte{}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
 	b := &bundle.Bundle{
 		Spec: specs.Spec{
 			Mounts: []specs.Mount{
 				{
 					Type:        "mkfs/ext4",
-					Source:      "/path/to/data1.img",
+					Source:      data1Path,
 					Destination: "/data1",
 					Options:     []string{"rw"},
 				},
 				{
 					Type:        "mkfs/ext4",
-					Source:      "/path/to/data2.img",
+					Source:      data2Path,
 					Destination: "/data2",
 					Options:     []string{"rw"},
 				},

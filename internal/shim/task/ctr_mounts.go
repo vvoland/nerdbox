@@ -21,7 +21,10 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/containerd/log"
@@ -47,6 +50,10 @@ type ctrMountTransform struct {
 
 	// fsType is the filesystem type (e.g., "ext4").
 	fsType string
+
+	// size is the size of the disk image to create (from X-containerd.mkfs.size option).
+	// If 0, the file must already exist.
+	size int64
 
 	// readOnly indicates if the disk should be read-only.
 	readOnly bool
@@ -121,7 +128,7 @@ func (t *ctrMountTransformer) processCtrMount(ctx context.Context, index int, m 
 
 // processMkfsMount handles mounts with type "mkfs/<fstype>" (e.g., "mkfs/ext4").
 // These mounts have a source pointing to an image file that should be:
-// 1. Formatted with mkfs on the host (handled by the snapshotter)
+// 1. Created and formatted with mkfs (if X-containerd.mkfs.size is specified)
 // 2. Attached as a block device to the VM
 // 3. Mounted inside the VM at the specified destination
 func (t *ctrMountTransformer) processMkfsMount(ctx context.Context, index int, m *specs.Mount) (*ctrMountTransform, error) {
@@ -133,10 +140,25 @@ func (t *ctrMountTransformer) processMkfsMount(ctx context.Context, index int, m
 
 	originalSource := m.Source
 
+	// Extract size from options (X-containerd.mkfs.size=<bytes>)
+	var size int64
+	for _, o := range m.Options {
+		if strings.HasPrefix(o, "X-containerd.mkfs.size=") {
+			sizeStr := strings.TrimPrefix(o, "X-containerd.mkfs.size=")
+			var err error
+			size, err = strconv.ParseInt(sizeStr, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid mkfs size %q: %w", sizeStr, err)
+			}
+			break
+		}
+	}
+
 	log.G(ctx).WithFields(log.Fields{
 		"source":      originalSource,
 		"destination": m.Destination,
 		"fstype":      fsType,
+		"size":        size,
 	}).Debug("processing mkfs mount for VM")
 
 	// Check if read-only based on options
@@ -150,12 +172,14 @@ func (t *ctrMountTransformer) processMkfsMount(ctx context.Context, index int, m
 		specMount:      m,
 		originalSource: originalSource,
 		fsType:         fsType,
+		size:           size,
 		readOnly:       readOnly,
 	}, nil
 }
 
 // SetupVM attaches the required block devices to the VM instance and updates
-// the spec mounts with the VM device paths.
+// the spec mounts with the VM device paths. For mkfs mounts, it also creates
+// and formats the disk image file if it doesn't exist.
 func (t *ctrMountTransformer) SetupVM(ctx context.Context, vmi vm.Instance) error {
 	// If diskLetter wasn't set, start from 'a' (though this shouldn't happen
 	// in normal usage since SetStartingDiskLetter should be called first)
@@ -180,13 +204,25 @@ func (t *ctrMountTransformer) SetupVM(ctx context.Context, vmi vm.Instance) erro
 		// The device path inside the VM
 		vmDevicePath := fmt.Sprintf("/dev/vd%c", t.diskLetter)
 
-		// Check if source file exists
-		if fi, err := os.Stat(transform.originalSource); err != nil {
-			log.G(ctx).WithError(err).WithFields(log.Fields{
+		// Check if source file exists, create it if needed
+		if _, err := os.Stat(transform.originalSource); os.IsNotExist(err) {
+			if transform.size <= 0 {
+				return fmt.Errorf("source file %q does not exist and no size specified to create it", transform.originalSource)
+			}
+
+			log.G(ctx).WithFields(log.Fields{
 				"source": transform.originalSource,
-			}).Error("source file for disk does not exist")
-			return fmt.Errorf("source file %q does not exist: %w", transform.originalSource, err)
+				"size":   transform.size,
+				"fsType": transform.fsType,
+			}).Debug("creating and formatting disk image")
+
+			if err := createAndFormatDisk(ctx, transform.originalSource, transform.size, transform.fsType); err != nil {
+				return fmt.Errorf("creating disk image %s: %w", transform.originalSource, err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("checking source file %q: %w", transform.originalSource, err)
 		} else {
+			fi, _ := os.Stat(transform.originalSource)
 			log.G(ctx).WithFields(log.Fields{
 				"source": transform.originalSource,
 				"size":   fi.Size(),
@@ -225,6 +261,49 @@ func (t *ctrMountTransformer) SetupVM(ctx context.Context, vmi vm.Instance) erro
 
 		t.diskLetter++
 	}
+	return nil
+}
+
+// createAndFormatDisk creates a sparse file of the specified size and formats it
+// with the specified filesystem type.
+func createAndFormatDisk(ctx context.Context, path string, size int64, fsType string) error {
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("creating parent directory: %w", err)
+	}
+
+	// Create the sparse file
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("creating file: %w", err)
+	}
+
+	if err := f.Truncate(size); err != nil {
+		f.Close()
+		os.Remove(path)
+		return fmt.Errorf("truncating file to %d bytes: %w", size, err)
+	}
+
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return fmt.Errorf("closing file: %w", err)
+	}
+
+	// Format the file with mkfs
+	mkfsCmd := fmt.Sprintf("mkfs.%s", fsType)
+	cmd := exec.CommandContext(ctx, mkfsCmd, "-F", path)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		os.Remove(path)
+		return fmt.Errorf("running %s: %w, output: %s", mkfsCmd, err, string(output))
+	}
+
+	log.G(ctx).WithFields(log.Fields{
+		"path":   path,
+		"size":   size,
+		"fsType": fsType,
+	}).Debug("disk image created and formatted")
+
 	return nil
 }
 
