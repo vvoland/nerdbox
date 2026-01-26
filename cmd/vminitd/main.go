@@ -268,7 +268,7 @@ type ServiceConfig struct {
 	RPCPort        int
 	StreamPort     int
 	Networks       networks
-	Mounts         vmMounts
+	Mounts         bindMounts
 	Shutdown       shutdown.Service
 	Debug          bool
 }
