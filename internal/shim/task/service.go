@@ -39,6 +39,7 @@ import (
 	"github.com/containerd/errdefs/pkg/errgrpc"
 	"github.com/containerd/log"
 	"github.com/containerd/ttrpc"
+	"github.com/opencontainers/runtime-spec/specs-go"
 
 	bundleAPI "github.com/containerd/nerdbox/api/services/bundle/v1"
 	"github.com/containerd/nerdbox/api/services/vmevents/v1"
@@ -136,6 +137,25 @@ func (s *service) shutdown(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// ensureCgroupMount ensures the cgroup2 mount is present in the OCI spec.
+func ensureCgroupMount(ctx context.Context, b *bundle.Bundle) error {
+	// Don't add if it already exists
+	for _, m := range b.Spec.Mounts {
+		if m.Destination == "/sys/fs/cgroup" {
+			return nil
+		}
+	}
+
+	b.Spec.Mounts = append(b.Spec.Mounts, specs.Mount{
+		Destination: "/sys/fs/cgroup",
+		Type:        "cgroup2",
+		Source:      "cgroup2",
+		Options:     []string{"nosuid", "noexec", "nodev"},
+	})
+
+	return nil
+}
+
 // transformBindMounts transforms bind mounts
 func transformBindMounts(ctx context.Context, b *bundle.Bundle) error {
 	for i, m := range b.Spec.Mounts {
@@ -192,6 +212,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 		transformBindMounts,
 		nwpr.FromBundle,
 		ctrNetCfg.fromBundle,
+		ensureCgroupMount,
 		func(ctx context.Context, b *bundle.Bundle) error {
 			// If there are no VM networks, try falling back to host's resolv.conf (for TSI).
 			return addResolvConf(ctx, b, len(nwpr.nws) == 0)
