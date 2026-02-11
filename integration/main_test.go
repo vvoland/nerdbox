@@ -33,7 +33,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatalf("Failed to resolve build path: %v", err)
 	}
-	if err := os.Setenv("PATH", absPath+":"+os.Getenv("PATH")); err != nil {
+	if err := os.Setenv("PATH", absPath+string(os.PathListSeparator)+os.Getenv("PATH")); err != nil {
 		log.Fatalf("Failed to set PATH environment variable: %v", err)
 	}
 
@@ -43,6 +43,10 @@ func TestMain(m *testing.M) {
 }
 
 func runWithVM(t *testing.T, runTest func(*testing.T, vm.Instance)) {
+	runWithVMOpts(t, nil, runTest)
+}
+
+func runWithVMOpts(t *testing.T, startOpts []vm.StartOpt, runTest func(*testing.T, vm.Instance)) {
 	for _, tc := range []struct {
 		name string
 		vmm  vm.Manager
@@ -58,7 +62,7 @@ func runWithVM(t *testing.T, runTest func(*testing.T, vm.Instance)) {
 				t.Fatal("Failed to create VM instance:", err)
 			}
 
-			if err := vm.Start(t.Context()); err != nil {
+			if err := vm.Start(t.Context(), startOpts...); err != nil {
 				t.Fatal("Failed to start VM instance:", err)
 			}
 
