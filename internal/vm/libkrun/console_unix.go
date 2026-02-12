@@ -1,3 +1,5 @@
+//go:build !windows
+
 /*
    Copyright The containerd Authors.
 
@@ -14,16 +16,25 @@
    limitations under the License.
 */
 
-package task
+package libkrun
 
 import (
 	"context"
+	"io"
+	"os"
+	"syscall"
 
-	"github.com/containerd/containerd/api/types"
-
-	"github.com/containerd/nerdbox/internal/vm"
+	"github.com/containerd/fifo"
 )
 
-func setupMounts(ctx context.Context, vmi vm.Instance, id string, ms []*types.Mount, _, _ string) ([]*types.Mount, error) {
-	return transformMounts(ctx, vmi, id, ms)
+func setupConsole(ctx context.Context, vmc *vmcontext, path string) (io.ReadCloser, error) {
+	lr, err := fifo.OpenFifo(ctx, path, os.O_RDONLY|os.O_CREATE|syscall.O_NONBLOCK, 0644)
+	if err != nil {
+		return nil, err
+	}
+	if err := vmc.SetConsole(path); err != nil {
+		lr.Close()
+		return nil, err
+	}
+	return lr, nil
 }

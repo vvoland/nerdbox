@@ -1,3 +1,5 @@
+//go:build windows
+
 /*
    Copyright The containerd Authors.
 
@@ -14,25 +16,18 @@
    limitations under the License.
 */
 
-package task
+package libkrun
 
-import (
-	"context"
+import "golang.org/x/sys/windows"
 
-	"github.com/containerd/nerdbox/internal/shim/task/bundle"
-	"github.com/containerd/nerdbox/internal/vm"
-)
-
-type networkProvider struct{}
-
-func (p *networksProvider) FromBundle(ctx context.Context, b *bundle.Bundle) error {
-	return nil
+func dlOpen(path string) (uintptr, error) {
+	h, err := windows.LoadLibrary(path)
+	if err != nil {
+		return 0, err
+	}
+	return uintptr(h), nil
 }
 
-func (p *networksProvider) SetupVM(ctx context.Context, vmi vm.Instance) error {
-	return nil
-}
-
-func (p *networksProvider) InitArgs() []string {
-	return nil
+func dlClose(handle uintptr) error {
+	return windows.FreeLibrary(windows.Handle(handle))
 }

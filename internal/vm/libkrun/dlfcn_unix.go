@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !windows
 
 /*
    Copyright The containerd Authors.
@@ -16,16 +16,14 @@
    limitations under the License.
 */
 
-package task
+package libkrun
 
-import (
-	"context"
+import "github.com/ebitengine/purego"
 
-	"github.com/containerd/containerd/api/types"
+func dlOpen(path string) (uintptr, error) {
+	return purego.Dlopen(path, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+}
 
-	"github.com/containerd/nerdbox/internal/vm"
-)
-
-func setupMounts(ctx context.Context, vmi vm.Instance, id string, ms []*types.Mount, _, _ string) ([]*types.Mount, error) {
-	return transformMounts(ctx, vmi, id, ms)
+func dlClose(handle uintptr) error {
+	return purego.Dlclose(handle)
 }
