@@ -1,4 +1,4 @@
-//go:build !linux && !darwin
+//go:build !linux
 
 /*
    Copyright The containerd Authors.
@@ -26,6 +26,6 @@ import (
 	"github.com/containerd/nerdbox/internal/vm"
 )
 
-func setupMounts(_ context.Context, vmi vm.Instance, id string, ms []*types.Mount, rootfs, _ string) ([]*types.Mount, error) {
-	return ms, nil
+func setupMounts(ctx context.Context, vmi vm.Instance, id string, ms []*types.Mount, _, _ string) ([]*types.Mount, error) {
+	return transformMounts(ctx, vmi, id, ms)
 }
