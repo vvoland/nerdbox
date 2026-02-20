@@ -152,6 +152,13 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	}
 
 	presetup := time.Now()
+	defer func() {
+		log.G(ctx).WithFields(log.Fields{
+			"id":    r.ID,
+			"t":     time.Since(presetup),
+			"error": err,
+		}).Debug("Create task finished")
+	}()
 
 	// Libkrun panics if KVM is not available, so check it here.
 	if err := kvm.CheckKVM(); err != nil {
@@ -198,23 +205,28 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
+	log.G(ctx).WithField("t", time.Since(presetup)).Debug("vm instance ensured")
 
 	m, err := setupMounts(ctx, vmi, r.ID, r.Rootfs, b.Rootfs, filepath.Join(r.Bundle, "mounts"))
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
+	log.G(ctx).WithField("t", time.Since(presetup)).Debug("mounts prepared")
 
 	if err := nwpr.SetupVM(ctx, vmi); err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
+	log.G(ctx).WithField("t", time.Since(presetup)).Debug("vm networking prepared")
 
 	if err := bm.SetupVM(ctx, vmi); err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
+	log.G(ctx).WithField("t", time.Since(presetup)).Debug("vm bind mounts prepared")
 
 	if err := resCfg.SetupVM(ctx, vmi); err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
+	log.G(ctx).WithField("t", time.Since(presetup)).Debug("vm resources prepared")
 
 	prestart := time.Now()
 	if err := vmi.Start(ctx,
@@ -225,16 +237,19 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	}
 	bootTime := time.Since(prestart)
 	log.G(ctx).WithField("bootTime", bootTime).Debug("VM started")
+	log.G(ctx).WithField("t", time.Since(presetup)).Debug("vm started")
 
 	vmc, err := s.client()
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
+	log.G(ctx).WithField("t", time.Since(presetup)).Debug("vm client ready")
 	// Start forwarding events
 	sc, err := vmevents.NewTTRPCEventsClient(vmc).Stream(ctx, empty)
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
+	log.G(ctx).WithField("t", time.Since(presetup)).Debug("vm event stream connected")
 	ns, _ := namespaces.Namespace(ctx)
 	go func(ns string) {
 		for {
@@ -264,6 +279,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	if err != nil {
 		return nil, err
 	}
+	log.G(ctx).WithField("t", time.Since(presetup)).WithField("vmBundle", br.Bundle).Debug("bundle pushed to vm")
 
 	rio := stdio.Stdio{
 		Stdin:    r.Stdin,
@@ -276,6 +292,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
+	log.G(ctx).WithField("t", time.Since(presetup)).Debug("stdio forwarding configured")
 
 	// setupTime is the total time to setup the VM and everything needed
 	// to proxy the create task request. This measures the overall
@@ -310,6 +327,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 		}
 		return nil, errgrpc.ToGRPC(err)
 	}
+	log.G(ctx).WithField("t", time.Since(preCreate)).Debug("vm task create completed")
 
 	log.G(ctx).WithFields(log.Fields{
 		"t_boot":   bootTime,
@@ -320,26 +338,6 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	s.mu.Lock()
 	s.containers[r.ID] = c
 	s.mu.Unlock()
-
-	// TODO: Forward events rather than generate here?
-	//s.send(&eventstypes.TaskCreate{
-	//	ContainerID: r.ID,
-	//	Bundle:      r.Bundle,
-	//	Rootfs:      r.Rootfs,
-	//	IO: &eventstypes.TaskIO{
-	//		Stdin:    r.Stdin,
-	//		Stdout:   r.Stdout,
-	//		Stderr:   r.Stderr,
-	//		Terminal: r.Terminal,
-	//	},
-	//	Pid: resp.Pid,
-	//})
-
-	// The following line cannot return an error as the only state in which that
-	// could happen would also cause the container.Pid() call above to
-	// nil-deference panic.
-	//proc, _ := container.Process("")
-	//handleStarted(container, proc)
 
 	return &taskAPI.CreateTaskResponse{
 		Pid: resp.Pid,
@@ -542,15 +540,6 @@ func (s *service) CloseIO(ctx context.Context, r *taskAPI.CloseIORequest) (*ptyp
 // Checkpoint the container
 func (s *service) Checkpoint(ctx context.Context, r *taskAPI.CheckpointTaskRequest) (*ptypes.Empty, error) {
 	log.G(ctx).WithFields(log.Fields{"id": r.ID}).Info("checkpoint")
-	/*
-		container, err := s.getContainer(r.ID)
-		if err != nil {
-			return nil, err
-		}
-		if err := container.Checkpoint(ctx, r); err != nil {
-			return nil, errgrpc.ToGRPC(err)
-		}
-	*/
 	return empty, nil
 }
 
@@ -597,10 +586,6 @@ func (s *service) Connect(ctx context.Context, r *taskAPI.ConnectRequest) (*task
 
 func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (*ptypes.Empty, error) {
 	log.G(ctx).WithFields(log.Fields{"id": r.ID}).Info("shutdown")
-
-	// TODO: Should we forward this to VM?
-	//tc := taskAPI.NewTTRPCTaskClient(s.vm.Client())
-	//return tc.Shutdown(ctx, r)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -236,6 +236,13 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID))
 
 	log.G(ctx).WithField("bundle", r.Bundle).Infof("Create task")
+	start := time.Now()
+	defer func() {
+		log.G(ctx).WithFields(log.Fields{
+			"t":     time.Since(start),
+			"error": err,
+		}).Debug("Create task finished")
+	}()
 
 	s.lifecycleMu.Lock()
 	handleStarted, cleanup := s.preStart(nil)
