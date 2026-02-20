@@ -151,7 +151,7 @@ func (p *Init) Create(ctx context.Context, r *CreateConfig) (retError error) {
 		opts.ConsoleSocket = socket
 	}
 
-	if err := p.runtime.Create(context.WithoutCancel(ctx), r.ID, r.Bundle, opts); err != nil {
+	if err := p.runtime.Create(ctx, r.ID, r.Bundle, opts); err != nil {
 		systools.DumpFile(ctx, p.runtime.Log)
 		return p.runtimeError(err, "OCI runtime create failed")
 	}
