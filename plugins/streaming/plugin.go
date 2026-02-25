@@ -32,7 +32,7 @@ func init() {
 		Type:     plugins.StreamingPlugin,
 		ID:       "manager",
 		Requires: []plugin.Type{},
-		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+		InitFn: func(ic *plugin.InitContext) (any, error) {
 			sm := &streamManager{
 				streams: map[string]*managedStream{},
 			}
