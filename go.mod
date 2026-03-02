@@ -71,6 +71,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/containerd/containerd/v2 => github.com/dmcgowan/containerd/v2 v2.2.1-0.20260219172701-a843f050dc36
+replace github.com/containerd/containerd/v2 => github.com/vvoland/containerd/v2 v2.0.1-0.20260302180740-8ad0f880e75c
 
-replace github.com/containerd/containerd/api => github.com/dmcgowan/containerd/api v1.10.1-0.20260219172701-a843f050dc36
+replace github.com/containerd/containerd/api => github.com/vvoland/containerd/api v0.0.0-20260302180740-8ad0f880e75c
