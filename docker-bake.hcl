@@ -10,6 +10,10 @@ variable "KERNEL_ARCH" {
   default = "x86_64"
 }
 
+variable "KERNEL_PAGE_SIZE" {
+  default = ""
+}
+
 variable "KERNEL_NPROC" {
   default = "4"
 }
@@ -42,6 +46,7 @@ target "_common" {
   args = {
     KERNEL_VERSION = KERNEL_VERSION
     KERNEL_ARCH = KERNEL_ARCH
+    KERNEL_PAGE_SIZE = KERNEL_PAGE_SIZE
     KERNEL_NPROC = KERNEL_NPROC
     GO_BUILD_FLAGS = GO_BUILD_FLAGS
     GO_GCFLAGS = GO_GCFLAGS

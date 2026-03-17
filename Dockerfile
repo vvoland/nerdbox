@@ -49,6 +49,7 @@ RUN --mount=type=cache,sharing=locked,id=kernel-aptlib,target=/var/lib/apt \
 
 ARG KERNEL_VERSION="6.12.44"
 ARG KERNEL_ARCH="x86_64"
+ARG KERNEL_PAGE_SIZE=""
 ARG KERNEL_NPROC="4"
 
 # Install cross-compiler if host architecture differs from target
@@ -84,6 +85,42 @@ RUN <<EOT
     for patch in $(ls -d /usr/src/linux/patches/*.patch); do
         patch -p1 -d /usr/src/linux < "$patch";
     done
+EOT
+
+# Validate KERNEL_PAGE_SIZE and adjust kernel config when needed.
+# Only "4k" (or empty, same as 4k) and "16k" are accepted; 16k is arm64-only.
+RUN <<EOT
+    set -e
+    case "${KERNEL_PAGE_SIZE}" in
+        ""|4k) ;;
+        16k)
+            if [ "${KERNEL_ARCH}" != "arm64" ]; then
+                echo "ERROR: KERNEL_PAGE_SIZE=16k is only supported for arm64, not ${KERNEL_ARCH}" >&2
+                exit 1
+            fi
+
+            /usr/src/linux/scripts/config --file /usr/src/linux/.config \
+                --disable CONFIG_ARM64_4K_PAGES \
+                --enable CONFIG_ARM64_16K_PAGES
+
+            HOST_ARCH=$(uname -m)
+            case "${HOST_ARCH}" in
+                aarch64) HOST_ARCH=arm64 ;;
+            esac
+            CROSS_COMPILE=""
+            if [ "${HOST_ARCH}" != "${KERNEL_ARCH}" ]; then
+                case "${KERNEL_ARCH}" in
+                    arm64) CROSS_COMPILE=aarch64-linux-gnu- ;;
+                    x86_64) CROSS_COMPILE=x86_64-linux-gnu- ;;
+                esac
+            fi
+            cd /usr/src/linux && ARCH="${KERNEL_ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" make olddefconfig
+            ;;
+        *)
+            echo "ERROR: unsupported KERNEL_PAGE_SIZE=\"${KERNEL_PAGE_SIZE}\"; expected \"4k\" or \"16k\"" >&2
+            exit 1
+            ;;
+    esac
 EOT
 
 # Build the kernel

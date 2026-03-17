@@ -53,13 +53,17 @@ GO_STATIC_LDFLAGS := -ldflags '-extldflags "-static" $(LDFLAGS) $(EXTRA_LDFLAGS)
 MODULE_NAME=$(shell go list -m)
 API_PACKAGES=$(shell ($(GO) list ${GO_TAGS} ./... | grep /api/ ))
 
+# KERNEL_PAGE_SIZE selects the page size for the guest kernel.
+# Leave empty for 4K pages (default), set to "16k" for 16K pages (arm64 only).
+KERNEL_PAGE_SIZE ?=
+
 .PHONY: clean all build validate lint generate protos check-protos check-api-descriptors proto-fmt shell
 
 all: build
 
 build:
 	@echo "$(WHALE) $@"
-	HOST_OS=$(shell uname -s | tr '[:upper:]' '[:lower:]') KERNEL_ARCH=$(ARCH) $(BUILDX) bake
+	HOST_OS=$(shell uname -s | tr '[:upper:]' '[:lower:]') KERNEL_ARCH=$(ARCH) KERNEL_PAGE_SIZE=$(KERNEL_PAGE_SIZE) $(BUILDX) bake
 
 _output/containerd-shim-nerdbox-v1: cmd/containerd-shim-nerdbox-v1 FORCE
 	@echo "$(WHALE) $@"
